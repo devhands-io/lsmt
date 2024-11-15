@@ -1,0 +1,437 @@
+#!/usr/bin/env php
+<?
+
+class LSMT {
+    var $arc = NULL;
+    var $argv = NULL;
+    var $supported_commands = [];
+    var $options = NULL;
+    var $command = NULL;
+    var $debug = FALSE;
+    var $json_nested_depth = 16384;
+    
+    function __construct() {
+        $this->argc = $_SERVER['argc'];
+        $this->argv = $_SERVER['argv'];
+        
+        $this->supported_commands = ['extract', 'generate', 'plot', 'help'];
+        $this->supported_origins = ['auto', 'memtier-json', 'memtier', 'wrk', 'redis-benchmark', 'sysbench'];
+
+        $options_short = 'v';
+        $options_long = ['extract', 'generate', 'plot', 'help', 'version', 'origin:', 'files:', 'out:', 'cycles:', 'debug', 'sleep:'];
+        $this->options = getopt($options_short, $options_long);
+
+        $this->checkOptions();
+    }
+
+    function getOption($name) {
+        if (key_exists($name, $this->options)) {
+            return $this->options[$name];
+        }
+
+        return null;
+    }
+
+    function checkOptions() {
+        $command_found = FALSE;
+        foreach ($this->supported_commands as $command) {
+            if (is_array($this->options) && key_exists($command, $this->options)) {
+                if ($command_found) {
+                    $this->error('only one suppoted command can be used: lsmt --<command> --<p1>[=<value1>] ... --<pN>[=<valueN>]');
+                    return FALSE;
+                }
+
+                $command_found = TRUE;
+                if ($this->verifyCommand($command)) {
+                    $this->command = $command;
+                }
+            }
+        }
+
+        if (key_exists('debug', $this->options)) {
+            $this->debug = TRUE;
+        }
+
+        if ($command_found && !empty($this->command)) {
+            return TRUE;
+        }
+
+        $this->error('Empty or unsupported command. Supported commands are: --' . join(', --', $this->supported_commands));
+
+        return FALSE;
+    }
+
+    function verifyCommand(string $command) {
+        if (empty($command) || !in_array($command, $this->supported_commands)) {
+            return FALSE;
+        }
+
+        return TRUE;
+    }
+
+    function run() {
+        switch ($this->command) {
+            case 'version':
+                $this->printVersion();
+                break;
+            case 'usage':
+                $this->printUsage();
+                break;
+            case 'help':
+                $this->printUsage();
+                break;
+            case 'extract':
+                $this->dispatchExtract();
+                break;
+            case 'generate':
+                $this->generateExecSeries();
+                break;
+            default:
+                $this->error('command "' . $this->command . '" is planned but not supported yet');
+        }
+
+        return TRUE;
+    }
+
+    function dispatchExtract() {
+        $params = array();
+
+        if (!$this->prepareExtractParams($params)) {
+            return FALSE;
+        }
+
+        $this->processFiles($params);
+
+        return TRUE;
+    }
+
+    function prepareExtractParams(array &$params) {
+        $origin = $this->getOption('origin');
+
+        if (empty($origin) || !is_string($origin)) {
+            return $this->error('Origin (--origin=value) is required when using --extract command.'. 
+                ' Use "lsmt help" to see supported origins and examples.');
+        }
+
+        if (!in_array($origin, $this->supported_origins)) {
+            return $this->error('Origin "' . (string)$origin . '" is not supported. Supported origins are: '. $this->getSupportedOrigins() .
+                '. Use --origin=<origin> or use "lsmt help" to see more examples. ');
+        }
+
+        $files = $this->getOption('files');
+        if (empty($files) || !is_string($files)) {
+            return $this->error('Files pattern (--files="<pattern>") is required when using --extract command.'.
+                ' Use "lsmt help" to see examples.');
+        }
+
+        $params['origin'] = $origin;
+        $params['files'] = $files;
+
+        return TRUE;
+    }
+
+    function extractKeys(string $fname, &$keys) {
+        $kv_separators = ['-', '_']; 
+        $kv_regexp =  '/^([a-zA-Z]+)([\.0-9]+)/';
+
+        $base_name = pathinfo($fname, PATHINFO_FILENAME);
+
+        $keys = array();
+        foreach ($kv_separators as $s) {
+            $parts = explode($s, $base_name);
+            if (count($parts) <= 1) continue;
+
+            foreach ($parts as $p) {
+                if (preg_match($kv_regexp, $p, $matches)) {
+                    $keys[$matches[1]] = $matches[2];
+                }
+            }
+        }
+
+        return count($keys);
+    }
+
+    function processFiles(array $params) {
+        $pattern = $params['files'];
+        if ('~' === $pattern[0]) {
+            $pattern = getenv("HOME") . substr($pattern, 1);
+        }
+
+        $files = glob($pattern);
+
+        $output_tmpl = $this->getOption('out');
+
+        foreach ($files as $fname) {
+            $body = file_get_contents($fname);
+            if (empty($body)) {
+                $this->error('Empty body for file: ' . $fname);
+            }
+
+            $this->extractKeys($fname, $keys);
+            $this->debug('extracting keys from filename "' . $fname .'": ', $keys);
+
+            $data = array();
+            if (!$this->parseFileBody($body, $params, $data)) {
+                $this->error('Unable to parse file: ' . $fname);
+                continue;
+            }
+
+            $vars = $data + $keys;
+            if (!empty($output_tmpl)) {
+                echo $this->execTemplate($output_tmpl, $vars), PHP_EOL;
+            } else {
+                echo $this->formatKeyValueString($vars), PHP_EOL;
+            }
+        }
+
+        return TRUE;
+    }
+
+    function parseFileBody(string $body, array $params, array &$data) {
+        $origin = $params['origin'];
+        switch ($origin) {
+            case 'memtier-json':
+                return $this->parseMemtierJSON($body, $params, $data);
+                break;
+            case 'wrk':
+                return $this->parseWrk($body, $params, $data);
+                break;
+            default:
+                $this->error('oringin "' . $origin . '" is not supported. Supported origins are: '. $this->getSupportedOrigins());
+                break;
+        }
+
+        return TRUE;
+    }
+
+    function parseMemtierJSON(string $body, array $params, array &$data) {
+        $json_use_assoc = TRUE;
+        $json_nested_depth = $this->json_nested_depth;
+        $json_data = json_decode($body, $json_use_assoc, $json_nested_depth);
+        if (is_null($json_data)) {
+            return $this->error('Json_decode error: ' . json_last_error_msg());
+        }
+
+        if (empty($json_data['ALL STATS']) || empty($json_data['ALL STATS']['Totals'])) {
+            return $this->error('Unable to parse file (stats/totals data is empty): ' . $fname);
+        }
+
+        $totals = $json_data['ALL STATS']['Totals'];
+        $rps = $totals['Ops/sec'];
+        $percentile_latencies = $totals['Percentile Latencies'];
+
+        $data = ['rps' => $rps];
+        foreach ($percentile_latencies as $k => $v) {
+            if(preg_match('/p(\d+)\.*(\d*)/', $k, $matches)) {
+                $new_k = 'latency_p' . $matches[1];
+                if (isset($matches[2])) {
+                    $fractional = $matches[2];
+                    if ((int)$fractional > 0) {
+                        $new_k .= '_' .  $fractional;
+                    }
+                }
+                $data[$new_k] = $v;
+            }
+        }
+
+        return TRUE;
+    }
+
+    function parseWrk(string $body, array $params, array &$data) {
+
+        $data = [];
+        $regexp = '/^Requests\/sec\:\s+([\.0-9]+)$/m';
+        if(!preg_match($regexp, $body, $matches)) {
+            $this->error('[parseWrk] unable to extract RPS, regexp = "' . $regexp . '".');
+            return FALSE;
+        }
+        $data['rps'] = trim($matches[1]);
+
+        $latency_mappings = [
+            '50.000%' => 'latency_p50',
+            '75.000%' => 'latency_p75',
+            '90.000%' => 'latency_p90',
+            '99.000%' => 'latency_p99',
+            '99.900%' => 'latency_p99_9',
+            '99.990%' => 'latency_p99_99',
+            '99.990%' => 'latency_p99_99',
+        ];
+
+        foreach ($latency_mappings as $txt => $var) {
+            $matches = FALSE;
+            $regexp = '/^\s*' . preg_quote($txt, '/') . '\s+([0-9]+\.*[0-9]*)([a-z]+)/m';
+            if(!preg_match($regexp, $body, $matches)) {
+                $this->error('[parseWrk] unable to extract latency "' . $txt . '", regexp = "' . $regexp . '".');
+                continue;
+            }
+
+            $is_seconds = ('s' === $matches[2]) ? TRUE : FALSE;
+            $latency = (float)trim($matches[1]);
+            if ($is_seconds) {
+                $data[$var] = 1000*$latency;
+            } else {
+                $data[$var] = $latency;
+            }
+        }
+
+        if ($this->debug) var_dump($data);
+
+        return TRUE;
+    }
+
+    function generateExecSeries() {
+        $cycle = $this->getOption('cycles');
+        $sleep = $this->getOption('sleep');
+
+        $cycle_parts = FALSE;
+        $cycle_parts = explode(';', $cycle);
+
+        if (empty($cycle_parts) || (isset($cycle_parts[0]) && empty($cycle_parts[0]))) {
+            $cycle_parts = [$cycle];
+        }
+
+        $cycles_data = [];
+        foreach ($cycle_parts as $p) {
+            $matches = array();
+            $r = preg_match('/^([a-zA-Z0-9]+)=(\d+)\-(\d+)\,*(\d*)$/', $p, $matches);
+            $m = count($matches);
+
+            if ($m >= 4) {
+                $cycles_data[] = [
+                    'name'  => $matches[1],
+                    'min'   => (int)$matches[2],
+                    'max'   => (int)$matches[3],
+                    'step'  => (isset($matches[4]) && (int)($matches[4]) > 0) ? (int)($matches[4]) : 1,
+                    'current' => (int)$matches[2],
+                ];
+            } else {
+                $this->error('wrong cycle format: ' . $p . '; format: "v1=min1-max1[,step1];v2=min2-max2[,step2]...vN=minN-maxN[,stepN]"');
+            }
+        }
+    
+        while (1) {
+            $serie = [];
+            foreach ($cycles_data as $c) {
+                $c_name = $c['name'];
+                $c_current = $c['current'];
+                $serie[$c_name] = $c_current;
+            }
+
+            $out = $this->getOption('out');
+            if ($out) {
+                echo $this->execTemplate($out, $serie), PHP_EOL;
+            } else {
+                echo $this->formatKeyValueString($serie), PHP_EOL;
+            }
+
+            if ($sleep) echo 'sleep '. $sleep . ';', PHP_EOL, PHP_EOL;
+
+            $nested_loops = count($cycles_data);
+            $i = $nested_loops - 1;
+            $maximum_hits = 0;
+            while ($i >= 0) {
+                $i_current = $cycles_data[$i]['current'];
+                $i_max = $cycles_data[$i]['max'];
+                $i_step = $cycles_data[$i]['step'];
+                if (($i_current + $i_step) < $i_max) {
+                    $cycles_data[$i]['current'] = $i_current + $i_step;
+                    break;
+                }
+
+                $maximum_hits++;
+                $cycles_data[$i]['current'] = $cycles_data[$i]['min'];
+                $i--;
+            }
+
+            if ($maximum_hits == $nested_loops) break;
+        }
+
+        return TRUE;
+    }
+
+    function execTemplate($tmpl, $vars) {
+        $result = $tmpl;
+        $matches = [];
+        $n = preg_match_all('/{{([\._a-zA-Z0-9]+)}}/', $tmpl, $matches);
+        for ($i = 0; $i < $n; $i++) {
+            $tagged = $matches[0][$i];
+            $key = $matches[1][$i];
+            $value = isset($vars[$key]) ? $vars[$key] : '';
+            $result = str_replace($tagged, $value, $result);
+        }
+
+        return $result;
+    }
+
+    function formatKeyValueString($hash) {
+        if (empty($hash) || !is_array($hash)) {
+            return FALSE;
+        }
+
+        return implode(',', array_map(fn($k, $v) => "$k=$v", array_keys($hash), $hash));
+    }
+
+    function printUsage() {
+        echo 'Usage: lsmt --<command> --<p1>[=<value1>] ... --<pN>[=<valueN>]',  PHP_EOL;
+        echo ' * commands are: generate, extract, plot, help.', PHP_EOL;
+        echo ' * version: "lsmt -v" or "lsmt --version".', PHP_EOL;
+        echo "Supported origins (benchmarking tools): ". $this->getSupportedOrigins(), PHP_EOL; 
+
+        echo PHP_EOL;
+        $this->printExamples();
+        return TRUE;
+    }
+
+    function getSupportedOrigins() {
+        return join(', ', $this->supported_origins);
+    }
+
+    function printVersion() {
+        echo "Load Series Management Tool V0.1 (14-Nov-2024) // Alexey Rybak & devhands.io (C) 2024", PHP_EOL;
+        return TRUE;
+    }
+
+    function printExamples() {
+        echo 'Examples: ', PHP_EOL;
+
+        echo ' * lsmt --generate --out="/local/wrk -c128 -t8 -R{{R}} -d30 -L http://localhost > results/wrk_nginx_c128_t4_R{{R}}.txt"' . 
+            ' --cycles=\'R=10000-150000,10000\' --sleep=10', PHP_EOL;
+
+        echo ' * lsmt --extract --origin=wrk --files="results/wrk/*.txt" | sort -n -t, -k10.3 # comma-separated kv-pairs sorted by Rate value numerically ', PHP_EOL;
+
+        echo ' * lsmt --extract --origin=wrk --files="results/wrk/*.txt" --out="R={{R}}, rps={{rps}}, l={{latency_p99}}" | sort -t \',\' -n -k1.3 ' . 
+            '# template-based output sorted numerically by Rate values', PHP_EOL;
+
+        echo ' * lsmt --extract --files=\'/*\' --keys-separator=\'_\'  --origin=a,m,mj,rb,wrk (auto, memtier, memtier-json, redis-benchmark, wrk)'.
+            ' --out="rps={{rps}}, latency={{latency-p99}}" --separator="\n" --sort=rps', PHP_EOL;
+
+        echo ' * lsmt --extract --files=\'/*\' --origin=[auto|memtier|memtier-json|redis-benchmark|wrk]'.
+            ' --summary --skip-errors', PHP_EOL;
+
+        echo ' * lsmt --extract --files=\'/*\' --origin=[auto|memtier|memtier-json|redis-benchmark|wrk] '.
+            '--out="{Series: , RPS:{{rps}}, Latency:{{latency-p99}}},"', PHP_EOL;
+
+        echo ' * lsmt --plot --source="series.txt" --series="MyDB,PostgreSQL" --app=ObservablePlot', PHP_EOL; 
+
+        return TRUE;
+    }
+
+    function debug(string $message, array $data) {
+        if ($this->debug) {
+            echo 'DEBUG: ' . $message . var_export($data, TRUE), PHP_EOL;
+        }
+
+        return TRUE;
+    }
+
+    function error(string $message, int $level = 0) {
+        echo 'ERROR: ', $message, PHP_EOL;
+        return FALSE;
+    }
+
+}
+
+$LSMT = new LSMT();
+$LSMT->run();
+
+?>
